@@ -1,0 +1,16 @@
+{
+  "_instructions": "Copia come vinted-selectors.json e inserisci selettori verificati dal browser. Nessun selettore è assunto stabile. Per menu personalizzati usa action click_option e values per tradurre i valori locali.",
+  "title": {"selector": "", "action": "fill"},
+  "description": {"selector": "", "action": "fill"},
+  "price": {"selector": "", "action": "fill"},
+  "photos": {"selector": ""},
+  "category": {"selector": "", "action": "click_option", "values": {}},
+  "brand": {"selector": "", "action": "click_option"},
+  "size": {"selector": "", "action": "click_option"},
+  "condition": {"selector": "", "action": "click_option", "values": {}},
+  "color": {"selector": "", "action": "click_option"},
+  "material": {"selector": "", "action": "click_option"},
+  "package_size": {"selector": "", "action": "click_option"},
+  "publish": {"selector": ""},
+  "success": {"selector": ""}
+}
