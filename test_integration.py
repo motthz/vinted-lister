@@ -48,6 +48,8 @@ class IsolatedApp(unittest.TestCase):
         (self.root / "index.html").write_text(
             (core.ROOT / "index.html").read_text(encoding="utf-8"), encoding="utf-8"
         )
+        for asset in ("app.js", "style.css"):
+            (self.root / asset).write_bytes((core.ROOT / asset).read_bytes())
         self.stack = ExitStack()
         for module, name, value in [
             (core, "ROOT", self.root),

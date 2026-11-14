@@ -84,6 +84,16 @@ def validate_config(cfg):
         raise ValueError("Specifica il modello")
     if not isinstance(cfg.get("watch"), bool):
         raise ValueError("Monitoraggio non valido")
+    defaults = cfg.get("defaults", {})
+    if not isinstance(defaults, dict) or any(
+        k not in ("brand", "size", "material", "package_size", "condition")
+        or not isinstance(v, str)
+        or len(v) > 200
+        for k, v in defaults.items()
+    ):
+        raise ValueError("Valori predefiniti non validi")
+    if defaults.get("condition") and defaults["condition"] not in CONDITIONS:
+        raise ValueError("Stato predefinito non valido")
     rules = cfg.get("pricing")
     if not isinstance(rules, dict) or rules.get("mode") not in ("fixed", "formula"):
         raise ValueError("Modalità prezzo non valida")
@@ -103,6 +113,13 @@ def validate_config(cfg):
     if float(rules["minimum"]) > float(rules["maximum"]):
         raise ValueError("Il minimo supera il massimo")
     return cfg
+
+
+def apply_defaults(item, cfg):
+    for field, value in cfg.get("defaults", {}).items():
+        if not item.get(field) and value.strip():
+            item[field] = value.strip()
+    return item
 
 
 def read_json(path, default=None):

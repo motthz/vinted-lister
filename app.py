@@ -1,18 +1,26 @@
+import base64
+import io
 import json
 import mimetypes
 import os
+import re
 import threading
 import time
+import uuid
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+
+from PIL import Image
 
 from core import (
     DATA,
     FIELDS,
     ROOT,
     analyze,
+    apply_defaults,
     config,
     groups,
     missing,
@@ -22,11 +30,69 @@ from core import (
     validate_config,
     write_json,
 )
+from credentials import remember_key, restore_key
 
 LOCK = threading.RLock()
 STATE = {"busy": False, "message": "Pronto", "errors": []}
 DB = DATA / "items.json"
 TOKEN = os.urandom(24).hex()
+
+
+def export_item(item, parent):
+    import shutil
+
+    if missing(item):
+        raise ValueError("Completa prima: " + ", ".join(missing(item)))
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", item["id"]):
+        raise ValueError("ID non valido")
+    dest = parent / item["id"]
+    dest.mkdir(parents=True, exist_ok=True)
+    names = []
+    for index, file in enumerate(item["photos"]):
+        name = f"{index + 1:02}{Path(file).suffix.lower()}"
+        shutil.copy2(file, dest / name)
+        names.append(name)
+    exported = dict(item, photos=names)
+    write_json(dest / "annuncio.json", exported)
+    (dest / "annuncio.txt").write_text(
+        "\n\n".join(f"{f}: {item.get(f, '')}" for f in FIELDS + ["price"]), encoding="utf-8"
+    )
+    return dest
+
+
+def import_photos(body):
+    photos = body.get("photos")
+    if not isinstance(photos, list) or not 1 <= len(photos) <= 20:
+        raise ValueError("Scegli da 1 a 20 foto dello stesso capo")
+    images = []
+    total = 0
+    for photo in photos:
+        if not isinstance(photo, dict) or not isinstance(photo.get("data"), str):
+            raise ValueError("Foto non valida")
+        raw = base64.b64decode(photo["data"], validate=True)
+        total += len(raw)
+        if total > 20 * 1024 * 1024:
+            raise ValueError("Massimo 20 MB per capo")
+        with Image.open(io.BytesIO(raw)) as im:
+            if im.format not in ("JPEG", "PNG", "WEBP"):
+                raise ValueError("Usa foto JPG, PNG o WEBP")
+            extension = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}[im.format]
+            im.verify()
+        images.append((raw, extension))
+    folder = (ROOT / config()["folder"]).expanduser().resolve()
+    if not folder.is_dir():
+        raise ValueError("La cartella scelta non è disponibile: scegline una dalle impostazioni")
+    dest = folder / ("capo-" + uuid.uuid4().hex[:12])
+    dest.mkdir()
+    try:
+        for index, (raw, extension) in enumerate(images):
+            (dest / f"{index + 1:02}{extension}").write_bytes(raw)
+    except OSError:
+        import shutil
+
+        shutil.rmtree(dest)
+        raise
+    return dest
 
 
 def scan():
@@ -44,8 +110,13 @@ def scan():
                     continue
                 STATE["message"] = f"Analisi: {name}"
             try:
-                item = analyze(files, cfg["model"])
-                item.update(id=ident, name=name, photos=[str(p) for p in files], status="draft")
+                item = apply_defaults(analyze(files, cfg["model"]), cfg)
+                item.update(
+                    id=ident,
+                    name=name,
+                    photos=[str(p) for p in files],
+                    status="ready" if not missing(item) else "draft",
+                )
                 item["price"], item["price_reason"] = price(item, cfg["pricing"])
                 with LOCK:
                     items = read_json(DB, {})
@@ -111,16 +182,49 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/":
             html = (ROOT / "index.html").read_text(encoding="utf-8").replace("__TOKEN__", TOKEN)
             return self.send(html.encode(), kind="text/html")
+        if url.path in ("/app.js", "/style.css"):
+            file = ROOT / url.path[1:]
+            return self.send(
+                file.read_bytes(), kind="text/javascript" if file.suffix == ".js" else "text/css"
+            )
         if url.path == "/api/state":
             with LOCK:
                 return self.send(
                     {
                         "config": config(),
+                        "app": "vinted-studio",
                         "items": list(read_json(DB, {}).values()),
                         "state": STATE,
                         "has_key": bool(os.environ.get("OPENAI_API_KEY")),
+                        "categories": list(config()["pricing"]["base"]),
+                        "remember_key": os.name == "nt",
+                        "missing": {key: missing(item) for key, item in read_json(DB, {}).items()},
                     }
                 )
+        if url.path == "/download":
+            import tempfile
+
+            with LOCK:
+                items = [
+                    i
+                    for i in read_json(DB, {}).values()
+                    if i.get("status") == "ready" and not missing(i)
+                ]
+            if not items:
+                return self.send({"error": "Nessun annuncio pronto"}, 400)
+            try:
+                with tempfile.TemporaryDirectory() as tmp:
+                    parent = Path(tmp)
+                    for item in items:
+                        export_item(item, parent)
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as archive:
+                        for file in sorted(parent.rglob("*")):
+                            if file.is_file():
+                                archive.write(file, file.relative_to(parent).as_posix())
+                return self.send(buf.getvalue(), kind="application/zip")
+            except (ValueError, OSError) as exc:
+                return self.send({"error": str(exc)}, 400)
         if url.path == "/photo":
             q = parse_qs(url.query)
             try:
@@ -141,7 +245,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send({"error": "Richiesta non autorizzata"}, 403)
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length > 1000000:
+            limit = 29 * 1024 * 1024 if self.path == "/api/import" else 1000000
+            if length > limit:
                 # Drain a bounded amount so Windows clients receive the error
                 # rather than a TCP reset while still sending a modest upload.
                 self.connection.settimeout(5)
@@ -154,6 +259,45 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Oggetto JSON richiesto")
             if self.path == "/api/scan":
                 start_scan()
+            elif self.path == "/api/key":
+                key = body.get("key", "")
+                if (
+                    not isinstance(key, str)
+                    or not key.strip()
+                    or len(key) > 500
+                    or any(c.isspace() for c in key.strip())
+                ):
+                    raise ValueError("Inserisci una chiave API valida, senza spazi")
+                key = key.strip()
+                if body.get("remember"):
+                    remember_key(DATA / "api-key.dpapi", key)
+                else:
+                    (DATA / "api-key.dpapi").unlink(missing_ok=True)
+                os.environ["OPENAI_API_KEY"] = key
+                return self.send({"ok": True})
+            elif self.path == "/api/import":
+                with LOCK:
+                    if (DATA / "publisher.lock").exists():
+                        raise ValueError("Attendi la fine della compilazione browser")
+                    dest = import_photos(body)
+                if not STATE["busy"]:
+                    start_scan()
+                else:
+                    # An in-flight folder iterator may not include the new folder.
+                    threading.Thread(target=scan_after_current, daemon=True).start()
+                return self.send({"ok": True, "name": dest.name})
+            elif self.path == "/api/defaults":
+                with LOCK:
+                    if (DATA / "publisher.lock").exists():
+                        raise ValueError("Attendi la fine della compilazione browser")
+                    cfg = config()
+                    items = read_json(DB, {})
+                    for item in items.values():
+                        if item.get("status") in ("draft", "ready"):
+                            apply_defaults(item, cfg)
+                            item["price"], item["price_reason"] = price(item, cfg["pricing"])
+                            item["status"] = "draft" if missing(item) else "ready"
+                    write_json(DB, items)
             elif self.path == "/api/folder":
                 import subprocess
 
@@ -202,23 +346,7 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/export":
                 items = read_json(DB, {})
                 item = items[body["id"]]
-                if missing(item):
-                    raise ValueError("Completa prima: " + ", ".join(missing(item)))
-                import shutil
-
-                dest = DATA / "exports" / item["id"]
-                dest.mkdir(parents=True, exist_ok=True)
-                for i, file in enumerate(item["photos"]):
-                    shutil.copy2(file, dest / f"{i + 1:02}{Path(file).suffix}")
-                exported = dict(
-                    item,
-                    photos=[f"{i + 1:02}{Path(f).suffix}" for i, f in enumerate(item["photos"])],
-                )
-                write_json(dest / "annuncio.json", exported)
-                (dest / "annuncio.txt").write_text(
-                    "\n\n".join(f"{f}: {item.get(f, '')}" for f in FIELDS + ["price"]),
-                    encoding="utf-8",
-                )
+                dest = export_item(item, DATA / "exports")
                 return self.send({"ok": True, "path": str(dest)})
             else:
                 return self.send({"error": "Non trovato"}, 404)
@@ -231,10 +359,31 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("Host", "").split(":")[0].lower() in ("127.0.0.1", "localhost")
 
 
+def scan_after_current():
+    while STATE["busy"]:
+        time.sleep(0.2)
+    start_scan()
+
+
 if __name__ == "__main__":
     (ROOT / "photos").mkdir(exist_ok=True)
+    restore_key(DATA / "api-key.dpapi")
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
+    except OSError:
+        from urllib.request import urlopen
+
+        try:
+            with urlopen("http://127.0.0.1:8765/api/state", timeout=3) as response:
+                if json.load(response).get("app") != "vinted-studio":
+                    raise RuntimeError("Porta 8765 occupata da un’altra applicazione")
+            webbrowser.open("http://127.0.0.1:8765")
+            raise SystemExit(0)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Porta 8765 occupata: chiudi l’altra applicazione e riprova"
+            ) from exc
     threading.Thread(target=watcher, daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
     print("Vinted Studio: http://127.0.0.1:8765", flush=True)
     webbrowser.open("http://127.0.0.1:8765")
     server.serve_forever()

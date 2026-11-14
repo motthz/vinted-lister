@@ -6,7 +6,7 @@ line-length = 100
 select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.coverage.run]
-source = ["app", "core", "publisher"]
+source = ["app", "core", "publisher", "credentials"]
 
 [tool.coverage.report]
 show_missing = true
